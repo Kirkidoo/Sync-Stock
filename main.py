@@ -43,12 +43,15 @@ def run_query(query, variables=None):
 def get_shopify_product_map():
     """
     Fetches ONLY inventory items assigned to the Thibault Location.
+    Also checks if 'Track Quantity' is enabled.
     """
     print(f"Fetching products ONLY from Location {TARGET_LOCATION_ID}...")
     product_map = {}
     has_next_page = True
     cursor = None
+    untracked_count = 0
 
+    # Added 'tracked' field to query
     query = """
     query ($locationId: ID!, $cursor: String) {
       location(id: $locationId) {
@@ -61,6 +64,7 @@ def get_shopify_product_map():
             node {
               item { 
                 id
+                tracked
                 variant {
                   sku
                 }
@@ -87,6 +91,15 @@ def get_shopify_product_map():
         
         for level in inventory_levels:
             item = level['node']['item']
+            
+            # Check tracking status
+            if not item.get('tracked'):
+                untracked_count += 1
+                # We verify one item for logging purposes
+                if untracked_count == 1:
+                     print(f"⚠️ WARNING: SKU {item.get('variant', {}).get('sku')} has 'Track Quantity' turned OFF. It cannot be updated.")
+                continue
+
             if item.get('variant'):
                 sku = item['variant']['sku']
                 item_id = item['id']
@@ -97,13 +110,15 @@ def get_shopify_product_map():
         has_next_page = page_info['hasNextPage']
         cursor = page_info['endCursor']
         
-    print(f"Mapped {len(product_map)} variants specifically assigned to Thibault.")
+    if untracked_count > 0:
+        print(f"⚠️ FOUND {untracked_count} PRODUCTS WITH TRACKING OFF. These were skipped.")
+        
+    print(f"Mapped {len(product_map)} TRACKED variants assigned to Thibault.")
     return product_map
 
 def get_supplier_inventory(sku_list):
     """
     Fetches stock from Importations Thibault.
-    Handles Status 400 gracefully if valid data is present.
     """
     if not sku_list:
         return {}
@@ -111,7 +126,6 @@ def get_supplier_inventory(sku_list):
     print(f"Fetching supplier data for {len(sku_list)} SKUs...")
     inventory_map = {}
     
-    # Batch size
     CHUNK_SIZE = 50
     chunks = [sku_list[i:i + CHUNK_SIZE] for i in range(0, len(sku_list), CHUNK_SIZE)]
 
@@ -125,16 +139,13 @@ def get_supplier_inventory(sku_list):
         params = {"sku": sku_query, "language": "en"}
         
         try:
-            print(f"Requesting supplier batch {i+1}/{len(chunks)}...")
+            # print(f"Requesting supplier batch {i+1}/{len(chunks)}...")
             response = requests.get(SUPPLIER_API_URL, headers=headers, params=params, timeout=30)
             
-            # Accept 400 as a valid response because Thibault sends 400 if ANY SKU is invalid,
-            # but still returns data for the valid ones.
             if response.status_code in [200, 400]:
                 try:
                     data = response.json()
                 except ValueError:
-                    print(f"Batch {i+1} returned invalid JSON.")
                     continue
 
                 if isinstance(data, dict):
@@ -148,14 +159,8 @@ def get_supplier_inventory(sku_list):
                                     qty = qty_data.get('value')
                                     if item_sku and qty is not None:
                                         inventory_map[item_sku] = int(qty)
-                    
-                    if 'errors' in data:
-                        print(f"Batch {i+1} had warnings: {data['errors']}")
-                else:
-                    print(f"Batch {i+1} unexpected format: {type(data)}")
-
             else:
-                print(f"Error fetching batch {i+1}: Status {response.status_code} - {response.text}")
+                print(f"Error fetching batch {i+1}: Status {response.status_code}")
 
         except Exception as e:
             print(f"Exception in batch {i+1}: {e}")
@@ -171,7 +176,13 @@ def bulk_update_inventory(location_id, updates):
         print("No updates to send.")
         return
 
-    # We only ask for 'name' and 'delta' to avoid the GraphQL error.
+    # PRINT VERIFICATION FOR USER
+    print("\n--- VERIFICATION: FIRST 3 UPDATES ---")
+    for i in range(min(3, len(updates))):
+        u = updates[i]
+        print(f"Attempting to set Item {u['inventoryItemId']} to Quantity: {u['quantity']}")
+    print("-------------------------------------\n")
+
     mutation = """
     mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
       inventorySetQuantities(input: $input) {
@@ -198,7 +209,7 @@ def bulk_update_inventory(location_id, updates):
             "input": {
                 "reason": "correction",
                 "name": "available",
-                "ignoreCompareQuantity": True, # <--- FIX ADDED HERE
+                "ignoreCompareQuantity": True,
                 "quantities": batch
             }
         }
