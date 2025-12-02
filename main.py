@@ -128,7 +128,7 @@ def get_supplier_inventory(sku_list):
             print(f"Requesting supplier batch {i+1}/{len(chunks)}...")
             response = requests.get(SUPPLIER_API_URL, headers=headers, params=params, timeout=30)
             
-            # FIX: Accept 400 as a valid response because Thibault sends 400 if ANY SKU is invalid,
+            # Accept 400 as a valid response because Thibault sends 400 if ANY SKU is invalid,
             # but still returns data for the valid ones.
             if response.status_code in [200, 400]:
                 try:
@@ -139,20 +139,16 @@ def get_supplier_inventory(sku_list):
 
                 if isinstance(data, dict):
                     items = data.get('items', [])
-                    # Safety check: Ensure 'items' is actually a list
                     if isinstance(items, list):
                         for item in items:
-                            # Safety check: Ensure 'item' is a dict
                             if isinstance(item, dict):
                                 item_sku = item.get('sku')
                                 qty_data = item.get('quantity', {})
-                                # Handle case where quantity might be null or missing
                                 if isinstance(qty_data, dict):
                                     qty = qty_data.get('value')
                                     if item_sku and qty is not None:
                                         inventory_map[item_sku] = int(qty)
                     
-                    # Print errors if present for debugging, but don't stop
                     if 'errors' in data:
                         print(f"Batch {i+1} had warnings: {data['errors']}")
                 else:
@@ -175,7 +171,6 @@ def bulk_update_inventory(location_id, updates):
         print("No updates to send.")
         return
 
-    # FIX: Removed 'quantity' from the return selection set.
     # We only ask for 'name' and 'delta' to avoid the GraphQL error.
     mutation = """
     mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
@@ -203,6 +198,7 @@ def bulk_update_inventory(location_id, updates):
             "input": {
                 "reason": "correction",
                 "name": "available",
+                "ignoreCompareQuantity": True, # <--- FIX ADDED HERE
                 "quantities": batch
             }
         }
