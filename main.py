@@ -4,25 +4,28 @@ import json
 import time
 
 # --- CONFIGURATION ---
-# Load secrets from Environment Variables (set by GitHub Actions)
 SHOP_URL = os.environ.get("SHOP_URL")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 
-if not SHOP_URL:
-    raise ValueError("Shop URL is missing. Add 'SHOP_URL' to GitHub Secrets.")
+# Supplier Credentials
+# Value in Secrets should be: https://api.importationsthibault.com/api/v1/stock
+SUPPLIER_API_URL = os.environ.get("SUPPLIER_API_URL")
+# Value in Secrets should be your Bearer token (e.g., "12345...")
+SUPPLIER_API_TOKEN = os.environ.get("SUPPLIER_API_TOKEN")
 
-if not ACCESS_TOKEN:
-    raise ValueError("Access Token is missing. Add 'SHOPIFY_ACCESS_TOKEN' to GitHub Secrets.")
+if not SHOP_URL or not ACCESS_TOKEN:
+    raise ValueError("Shopify credentials missing in GitHub Secrets.")
+
+if not SUPPLIER_API_URL or not SUPPLIER_API_TOKEN:
+    raise ValueError("Supplier credentials missing in GitHub Secrets.")
 
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
     "Content-Type": "application/json"
 }
 
-# Target Location ID for "Thibault" (ID: 105008496957)
-# We format it as a GraphQL Global ID: gid://shopify/Location/<ID>
+# Target Location: Thibault
 TARGET_LOCATION_ID = "gid://shopify/Location/105008496957"
-
 GRAPHQL_URL = f"https://{SHOP_URL}/admin/api/2024-01/graphql.json"
 
 def run_query(query, variables=None):
@@ -40,10 +43,7 @@ def run_query(query, variables=None):
     return data
 
 def get_shopify_product_map():
-    """
-    Fetches all variants and creates a map: SKU -> InventoryItemID.
-    This is needed because GraphQL updates inventory using the Item ID, not SKU.
-    """
+    """Fetches all variants and creates a map: SKU -> InventoryItemID."""
     print("Fetching Shopify products...")
     product_map = {}
     has_next_page = True
@@ -75,6 +75,7 @@ def get_shopify_product_map():
         for v in variants:
             sku = v['node']['sku']
             item_id = v['node']['inventoryItem']['id']
+            # Only map if SKU exists
             if sku:
                 product_map[sku] = item_id
         
@@ -85,34 +86,69 @@ def get_shopify_product_map():
     print(f"Mapped {len(product_map)} variants from Shopify.")
     return product_map
 
-def get_supplier_inventory():
+def get_supplier_inventory(sku_list):
     """
-    REPLACE THIS FUNCTION with your actual logic to get supplier data.
-    Should return a dictionary: {'SKU': quantity}
+    Fetches stock from Importations Thibault for the given SKUs.
+    We must chunk the SKUs because the API expects a comma-separated list
+    and URL length is limited.
     """
-    print("Fetching supplier data...")
+    print(f"Fetching supplier data for {len(sku_list)} SKUs...")
     
-    # --- EXAMPLE LOGIC (DELETE THIS AND ADD YOUR OWN) ---
-    # response = requests.get("https://supplier.com/feed.csv")
-    # parse_csv(response.text) ...
+    inventory_map = {}
     
-    # For now, we return dummy data for testing
-    return {
-        "SHIRT-BLUE-L": 50,
-        "SHIRT-RED-M": 0,
-        "PANTS-JEAN-32": 15
+    # Chunk SKUs into batches of 50 to keep URL short
+    CHUNK_SIZE = 50
+    chunks = [sku_list[i:i + CHUNK_SIZE] for i in range(0, len(sku_list), CHUNK_SIZE)]
+
+    headers = {
+        "Authorization": f"Bearer {SUPPLIER_API_TOKEN}",
+        "Accept": "application/json"
     }
-    # ----------------------------------------------------
+
+    for i, batch in enumerate(chunks):
+        # Join SKUs with commas: "SKU1,SKU2,SKU3"
+        sku_query = ",".join(batch)
+        
+        params = {
+            "sku": sku_query,
+            "language": "en" # Optional, but good practice
+        }
+        
+        try:
+            print(f"Requesting supplier batch {i+1}/{len(chunks)}...")
+            response = requests.get(SUPPLIER_API_URL, headers=headers, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                items = data.get('items', [])
+                
+                for item in items:
+                    item_sku = item.get('sku')
+                    # Access nested quantity.value
+                    # JSON structure: {"quantity": {"value": 8, "unit": ...}}
+                    qty_data = item.get('quantity', {})
+                    qty = qty_data.get('value')
+                    
+                    if item_sku and qty is not None:
+                        inventory_map[item_sku] = int(qty)
+            else:
+                print(f"Error fetching batch {i+1}: Status {response.status_code} - {response.text}")
+
+        except Exception as e:
+            print(f"Exception in batch {i+1}: {e}")
+        
+        # Be polite to their API
+        time.sleep(1)
+        
+    print(f"Successfully fetched stock for {len(inventory_map)} items.")
+    return inventory_map
 
 def bulk_update_inventory(location_id, updates):
-    """
-    Sends a bulk mutation to Shopify to update inventory.
-    """
+    """Sends a bulk mutation to Shopify to update inventory."""
     if not updates:
         print("No updates to send.")
         return
 
-    # GraphQL mutation for setting quantities
     mutation = """
     mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
       inventorySetQuantities(input: $input) {
@@ -132,7 +168,6 @@ def bulk_update_inventory(location_id, updates):
     }
     """
     
-    # Shopify recommends batches of ~250 max. We will do 100 to be safe.
     BATCH_SIZE = 100
     for i in range(0, len(updates), BATCH_SIZE):
         batch = updates[i:i + BATCH_SIZE]
@@ -145,31 +180,33 @@ def bulk_update_inventory(location_id, updates):
             }
         }
         
-        print(f"Sending batch {i//BATCH_SIZE + 1} with {len(batch)} items...")
+        print(f"Sending Shopify update batch {i//BATCH_SIZE + 1}...")
         data = run_query(mutation, variables)
         
-        # Check for user errors (business logic errors)
         user_errors = data['data']['inventorySetQuantities']['userErrors']
         if user_errors:
             print("Errors in batch:", user_errors)
         else:
             print("Batch success.")
         
-        # Basic rate limit handling
         time.sleep(1)
 
 def main():
-    # 1. Use the specific Location ID
     location_id = TARGET_LOCATION_ID
     print(f"Syncing to Location ID: {location_id}")
     
-    # 2. Get Shopify Map (SKU -> InventoryItemID)
+    # 1. Get all SKUs from Shopify
     shopify_map = get_shopify_product_map()
+    all_skus = list(shopify_map.keys())
     
-    # 3. Get Supplier Data (SKU -> Quantity)
-    supplier_data = get_supplier_inventory()
+    if not all_skus:
+        print("No products found in Shopify.")
+        return
+
+    # 2. Ask Supplier for stock of THESE specific SKUs
+    supplier_data = get_supplier_inventory(all_skus)
     
-    # 4. Prepare Updates
+    # 3. Match them up
     updates = []
     for sku, qty in supplier_data.items():
         if sku in shopify_map:
@@ -180,12 +217,8 @@ def main():
                 "locationId": location_id,
                 "quantity": int(qty)
             })
-        else:
-            print(f"Warning: Supplier SKU '{sku}' not found in Shopify.")
             
     print(f"Prepared {len(updates)} updates.")
-    
-    # 5. Execute Updates
     bulk_update_inventory(location_id, updates)
 
 if __name__ == "__main__":
