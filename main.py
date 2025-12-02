@@ -8,9 +8,7 @@ SHOP_URL = os.environ.get("SHOP_URL")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 
 # Supplier Credentials
-# Value in Secrets should be: https://api.importationsthibault.com/api/v1/stock
 SUPPLIER_API_URL = os.environ.get("SUPPLIER_API_URL")
-# Value in Secrets should be your Bearer token (e.g., "12345...")
 SUPPLIER_API_TOKEN = os.environ.get("SUPPLIER_API_TOKEN")
 
 if not SHOP_URL or not ACCESS_TOKEN:
@@ -25,6 +23,7 @@ HEADERS = {
 }
 
 # Target Location: Thibault
+# We use this ID to filter WHAT we fetch, and WHERE we update.
 TARGET_LOCATION_ID = "gid://shopify/Location/105008496957"
 GRAPHQL_URL = f"https://{SHOP_URL}/admin/api/2024-01/graphql.json"
 
@@ -43,24 +42,32 @@ def run_query(query, variables=None):
     return data
 
 def get_shopify_product_map():
-    """Fetches all variants and creates a map: SKU -> InventoryItemID."""
-    print("Fetching Shopify products...")
+    """
+    Fetches ONLY inventory items assigned to the Thibault Location.
+    This avoids fetching the 50,000 items from other locations.
+    """
+    print(f"Fetching products ONLY from Location {TARGET_LOCATION_ID}...")
     product_map = {}
     has_next_page = True
     cursor = None
 
+    # We query the 'location' directly, and ask for its 'inventoryLevels'
     query = """
-    query ($cursor: String) {
-      productVariants(first: 250, after: $cursor) {
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-        edges {
-          node {
-            sku
-            inventoryItem {
-              id
+    query ($locationId: ID!, $cursor: String) {
+      location(id: $locationId) {
+        inventoryLevels(first: 250, after: $cursor) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          edges {
+            node {
+              item: inventoryItem {
+                id
+                variant {
+                  sku
+                }
+              }
             }
           }
         }
@@ -69,31 +76,46 @@ def get_shopify_product_map():
     """
 
     while has_next_page:
-        data = run_query(query, variables={"cursor": cursor})
-        variants = data['data']['productVariants']['edges']
+        variables = {
+            "locationId": TARGET_LOCATION_ID,
+            "cursor": cursor
+        }
         
-        for v in variants:
-            sku = v['node']['sku']
-            item_id = v['node']['inventoryItem']['id']
-            # Only map if SKU exists
-            if sku:
-                product_map[sku] = item_id
+        data = run_query(query, variables)
         
-        page_info = data['data']['productVariants']['pageInfo']
+        # Check if location exists
+        if not data['data']['location']:
+            raise Exception("Location not found! Check the ID.")
+
+        inventory_levels = data['data']['location']['inventoryLevels']['edges']
+        
+        for level in inventory_levels:
+            # Navigate: InventoryLevel -> InventoryItem -> Variant -> SKU
+            item = level['node']['item']
+            
+            # Some inventory items might not be linked to a variant (rare, but possible)
+            if item.get('variant'):
+                sku = item['variant']['sku']
+                item_id = item['id']
+                
+                if sku:
+                    product_map[sku] = item_id
+        
+        page_info = data['data']['location']['inventoryLevels']['pageInfo']
         has_next_page = page_info['hasNextPage']
         cursor = page_info['endCursor']
         
-    print(f"Mapped {len(product_map)} variants from Shopify.")
+    print(f"Mapped {len(product_map)} variants specifically assigned to Thibault.")
     return product_map
 
 def get_supplier_inventory(sku_list):
     """
     Fetches stock from Importations Thibault for the given SKUs.
-    We must chunk the SKUs because the API expects a comma-separated list
-    and URL length is limited.
     """
+    if not sku_list:
+        return {}
+
     print(f"Fetching supplier data for {len(sku_list)} SKUs...")
-    
     inventory_map = {}
     
     # Chunk SKUs into batches of 50 to keep URL short
@@ -106,12 +128,11 @@ def get_supplier_inventory(sku_list):
     }
 
     for i, batch in enumerate(chunks):
-        # Join SKUs with commas: "SKU1,SKU2,SKU3"
         sku_query = ",".join(batch)
         
         params = {
             "sku": sku_query,
-            "language": "en" # Optional, but good practice
+            "language": "en"
         }
         
         try:
@@ -124,8 +145,6 @@ def get_supplier_inventory(sku_list):
                 
                 for item in items:
                     item_sku = item.get('sku')
-                    # Access nested quantity.value
-                    # JSON structure: {"quantity": {"value": 8, "unit": ...}}
                     qty_data = item.get('quantity', {})
                     qty = qty_data.get('value')
                     
@@ -137,8 +156,7 @@ def get_supplier_inventory(sku_list):
         except Exception as e:
             print(f"Exception in batch {i+1}: {e}")
         
-        # Be polite to their API
-        time.sleep(1)
+        time.sleep(0.5)
         
     print(f"Successfully fetched stock for {len(inventory_map)} items.")
     return inventory_map
@@ -195,15 +213,15 @@ def main():
     location_id = TARGET_LOCATION_ID
     print(f"Syncing to Location ID: {location_id}")
     
-    # 1. Get all SKUs from Shopify
+    # 1. Get ONLY the ~500 items at Thibault
     shopify_map = get_shopify_product_map()
     all_skus = list(shopify_map.keys())
     
     if not all_skus:
-        print("No products found in Shopify.")
+        print("No products found in Shopify for this location.")
         return
 
-    # 2. Ask Supplier for stock of THESE specific SKUs
+    # 2. Ask Supplier for stock of ONLY these 500 items
     supplier_data = get_supplier_inventory(all_skus)
     
     # 3. Match them up
