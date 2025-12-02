@@ -49,7 +49,6 @@ def get_shopify_product_map():
     has_next_page = True
     cursor = None
 
-    # CORRECTION: The field on InventoryLevel is 'item', not 'inventoryItem'
     query = """
     query ($locationId: ID!, $cursor: String) {
       location(id: $locationId) {
@@ -87,14 +86,10 @@ def get_shopify_product_map():
         inventory_levels = data['data']['location']['inventoryLevels']['edges']
         
         for level in inventory_levels:
-            # Navigate: InventoryLevel -> Item -> Variant -> SKU
             item = level['node']['item']
-            
-            # Check if item has a variant (some inventory items might not)
             if item.get('variant'):
                 sku = item['variant']['sku']
                 item_id = item['id']
-                
                 if sku:
                     product_map[sku] = item_id
         
@@ -107,7 +102,8 @@ def get_shopify_product_map():
 
 def get_supplier_inventory(sku_list):
     """
-    Fetches stock from Importations Thibault for the given SKUs.
+    Fetches stock from Importations Thibault.
+    Handles Status 400 gracefully if valid data is present.
     """
     if not sku_list:
         return {}
@@ -115,7 +111,7 @@ def get_supplier_inventory(sku_list):
     print(f"Fetching supplier data for {len(sku_list)} SKUs...")
     inventory_map = {}
     
-    # Chunk SKUs into batches of 50
+    # Batch size
     CHUNK_SIZE = 50
     chunks = [sku_list[i:i + CHUNK_SIZE] for i in range(0, len(sku_list), CHUNK_SIZE)]
 
@@ -126,27 +122,42 @@ def get_supplier_inventory(sku_list):
 
     for i, batch in enumerate(chunks):
         sku_query = ",".join(batch)
-        
-        params = {
-            "sku": sku_query,
-            "language": "en"
-        }
+        params = {"sku": sku_query, "language": "en"}
         
         try:
             print(f"Requesting supplier batch {i+1}/{len(chunks)}...")
             response = requests.get(SUPPLIER_API_URL, headers=headers, params=params, timeout=30)
             
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get('items', [])
-                
-                for item in items:
-                    item_sku = item.get('sku')
-                    qty_data = item.get('quantity', {})
-                    qty = qty_data.get('value')
+            # FIX: Accept 400 as a valid response because Thibault sends 400 if ANY SKU is invalid,
+            # but still returns data for the valid ones.
+            if response.status_code in [200, 400]:
+                try:
+                    data = response.json()
+                except ValueError:
+                    print(f"Batch {i+1} returned invalid JSON.")
+                    continue
+
+                if isinstance(data, dict):
+                    items = data.get('items', [])
+                    # Safety check: Ensure 'items' is actually a list
+                    if isinstance(items, list):
+                        for item in items:
+                            # Safety check: Ensure 'item' is a dict
+                            if isinstance(item, dict):
+                                item_sku = item.get('sku')
+                                qty_data = item.get('quantity', {})
+                                # Handle case where quantity might be null or missing
+                                if isinstance(qty_data, dict):
+                                    qty = qty_data.get('value')
+                                    if item_sku and qty is not None:
+                                        inventory_map[item_sku] = int(qty)
                     
-                    if item_sku and qty is not None:
-                        inventory_map[item_sku] = int(qty)
+                    # Print errors if present for debugging, but don't stop
+                    if 'errors' in data:
+                        print(f"Batch {i+1} had warnings: {data['errors']}")
+                else:
+                    print(f"Batch {i+1} unexpected format: {type(data)}")
+
             else:
                 print(f"Error fetching batch {i+1}: Status {response.status_code} - {response.text}")
 
@@ -164,6 +175,8 @@ def bulk_update_inventory(location_id, updates):
         print("No updates to send.")
         return
 
+    # FIX: Removed 'quantity' from the return selection set.
+    # We only ask for 'name' and 'delta' to avoid the GraphQL error.
     mutation = """
     mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
       inventorySetQuantities(input: $input) {
@@ -176,7 +189,6 @@ def bulk_update_inventory(location_id, updates):
           changes {
             name
             delta
-            quantity
           }
         }
       }
@@ -196,16 +208,19 @@ def bulk_update_inventory(location_id, updates):
         }
         
         print(f"Sending Shopify update batch {i//BATCH_SIZE + 1}...")
-        data = run_query(mutation, variables)
-        
-        if data.get('data') and data['data'].get('inventorySetQuantities'):
-             user_errors = data['data']['inventorySetQuantities']['userErrors']
-             if user_errors:
-                 print("Errors in batch:", user_errors)
-             else:
-                 print("Batch success.")
-        else:
-             print("Batch failed, unknown response structure:", data)
+        try:
+            data = run_query(mutation, variables)
+            
+            if data.get('data') and data['data'].get('inventorySetQuantities'):
+                 user_errors = data['data']['inventorySetQuantities']['userErrors']
+                 if user_errors:
+                     print("Errors in batch:", user_errors)
+                 else:
+                     print("Batch success.")
+            else:
+                 print("Batch failed, unknown response structure:", data)
+        except Exception as e:
+            print(f"Failed to send batch: {e}")
         
         time.sleep(1)
 
@@ -213,7 +228,6 @@ def main():
     location_id = TARGET_LOCATION_ID
     print(f"Syncing to Location ID: {location_id}")
     
-    # 1. Get ONLY the ~500 items at Thibault
     shopify_map = get_shopify_product_map()
     all_skus = list(shopify_map.keys())
     
@@ -221,10 +235,8 @@ def main():
         print("No products found in Shopify for this location.")
         return
 
-    # 2. Ask Supplier for stock of ONLY these items
     supplier_data = get_supplier_inventory(all_skus)
     
-    # 3. Match them up
     updates = []
     for sku, qty in supplier_data.items():
         if sku in shopify_map:
