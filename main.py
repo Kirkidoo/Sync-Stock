@@ -19,6 +19,10 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+# Target Location ID for "Thibault" (ID: 105008496957)
+# We format it as a GraphQL Global ID: gid://shopify/Location/<ID>
+TARGET_LOCATION_ID = "gid://shopify/Location/105008496957"
+
 GRAPHQL_URL = f"https://{SHOP_URL}/admin/api/2024-01/graphql.json"
 
 def run_query(query, variables=None):
@@ -34,31 +38,6 @@ def run_query(query, variables=None):
         raise Exception(f"GraphQL Errors: {data['errors']}")
         
     return data
-
-def get_primary_location_id():
-    """Fetches the first active location ID to store inventory."""
-    query = """
-    query {
-      locations(first: 5) {
-        edges {
-          node {
-            id
-            name
-            isActive
-          }
-        }
-      }
-    }
-    """
-    data = run_query(query)
-    locations = data['data']['locations']['edges']
-    
-    for loc in locations:
-        if loc['node']['isActive']:
-            print(f"Found Location: {loc['node']['name']}")
-            return loc['node']['id']
-            
-    raise Exception("No active location found!")
 
 def get_shopify_product_map():
     """
@@ -180,8 +159,9 @@ def bulk_update_inventory(location_id, updates):
         time.sleep(1)
 
 def main():
-    # 1. Get Location
-    location_id = get_primary_location_id()
+    # 1. Use the specific Location ID
+    location_id = TARGET_LOCATION_ID
+    print(f"Syncing to Location ID: {location_id}")
     
     # 2. Get Shopify Map (SKU -> InventoryItemID)
     shopify_map = get_shopify_product_map()
