@@ -6,68 +6,52 @@ import time
 # --- CONFIGURATION ---
 SHOP_URL = os.environ.get("SHOP_URL")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
-
-# Supplier Credentials
 SUPPLIER_API_URL = os.environ.get("SUPPLIER_API_URL")
 SUPPLIER_API_TOKEN = os.environ.get("SUPPLIER_API_TOKEN")
 
-if not SHOP_URL or not ACCESS_TOKEN:
-    raise ValueError("Shopify credentials missing in GitHub Secrets.")
+# --- DEBUG TRACER ---
+# Enter the SKU you are having trouble with here. 
+# The script will print DETAILED logs just for this item.
+TRACE_SKU = "6268059" 
 
-if not SUPPLIER_API_URL or not SUPPLIER_API_TOKEN:
-    raise ValueError("Supplier credentials missing in GitHub Secrets.")
+if not SHOP_URL or not ACCESS_TOKEN or not SUPPLIER_API_URL or not SUPPLIER_API_TOKEN:
+    raise ValueError("Missing secrets in GitHub.")
 
 HEADERS = {
     "X-Shopify-Access-Token": ACCESS_TOKEN,
     "Content-Type": "application/json"
 }
 
-# Target Location: Thibault
 TARGET_LOCATION_ID = "gid://shopify/Location/105008496957"
 GRAPHQL_URL = f"https://{SHOP_URL}/admin/api/2024-01/graphql.json"
 
 def run_query(query, variables=None):
-    """Helper function to execute GraphQL queries."""
     payload = {"query": query, "variables": variables}
     response = requests.post(GRAPHQL_URL, headers=HEADERS, json=payload)
-    
     if response.status_code != 200:
         raise Exception(f"Query failed: {response.status_code} - {response.text}")
-    
     data = response.json()
     if 'errors' in data:
         raise Exception(f"GraphQL Errors: {data['errors']}")
-        
     return data
 
 def get_shopify_product_map():
-    """
-    Fetches ONLY inventory items assigned to the Thibault Location.
-    Also checks if 'Track Quantity' is enabled.
-    """
     print(f"Fetching products ONLY from Location {TARGET_LOCATION_ID}...")
     product_map = {}
     has_next_page = True
     cursor = None
-    untracked_count = 0
 
-    # Added 'tracked' field to query
     query = """
     query ($locationId: ID!, $cursor: String) {
       location(id: $locationId) {
         inventoryLevels(first: 250, after: $cursor) {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
+          pageInfo { hasNextPage, endCursor }
           edges {
             node {
               item { 
                 id
                 tracked
-                variant {
-                  sku
-                }
+                variant { sku }
               }
             }
           }
@@ -77,69 +61,51 @@ def get_shopify_product_map():
     """
 
     while has_next_page:
-        variables = {
-            "locationId": TARGET_LOCATION_ID,
-            "cursor": cursor
-        }
-        
+        variables = {"locationId": TARGET_LOCATION_ID, "cursor": cursor}
         data = run_query(query, variables)
         
         if not data.get('data') or not data['data'].get('location'):
-            raise Exception(f"Location {TARGET_LOCATION_ID} not found or access denied.")
+            raise Exception(f"Location {TARGET_LOCATION_ID} not found.")
 
         inventory_levels = data['data']['location']['inventoryLevels']['edges']
         
         for level in inventory_levels:
             item = level['node']['item']
-            
-            # Check tracking status
-            if not item.get('tracked'):
-                untracked_count += 1
-                # We verify one item for logging purposes
-                if untracked_count == 1:
-                     print(f"⚠️ WARNING: SKU {item.get('variant', {}).get('sku')} has 'Track Quantity' turned OFF. It cannot be updated.")
-                continue
-
             if item.get('variant'):
                 sku = item['variant']['sku']
                 item_id = item['id']
                 if sku:
-                    product_map[sku] = item_id
-        
+                    # Strip whitespace to ensure match
+                    clean_sku = str(sku).strip()
+                    product_map[clean_sku] = item_id
+                    
+                    # TRACER
+                    if clean_sku == TRACE_SKU:
+                        print(f"🕵️ TRACER: Found {TRACE_SKU} in Shopify. Item ID: {item_id}")
+                        if not item.get('tracked'):
+                            print(f"🕵️ TRACER WARNING: {TRACE_SKU} is NOT tracking quantity in Shopify!")
+
         page_info = data['data']['location']['inventoryLevels']['pageInfo']
         has_next_page = page_info['hasNextPage']
         cursor = page_info['endCursor']
         
-    if untracked_count > 0:
-        print(f"⚠️ FOUND {untracked_count} PRODUCTS WITH TRACKING OFF. These were skipped.")
-        
-    print(f"Mapped {len(product_map)} TRACKED variants assigned to Thibault.")
+    print(f"Mapped {len(product_map)} variants.")
     return product_map
 
 def get_supplier_inventory(sku_list):
-    """
-    Fetches stock from Importations Thibault.
-    """
-    if not sku_list:
-        return {}
-
+    if not sku_list: return {}
     print(f"Fetching supplier data for {len(sku_list)} SKUs...")
     inventory_map = {}
     
     CHUNK_SIZE = 50
     chunks = [sku_list[i:i + CHUNK_SIZE] for i in range(0, len(sku_list), CHUNK_SIZE)]
-
-    headers = {
-        "Authorization": f"Bearer {SUPPLIER_API_TOKEN}",
-        "Accept": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {SUPPLIER_API_TOKEN}", "Accept": "application/json"}
 
     for i, batch in enumerate(chunks):
         sku_query = ",".join(batch)
         params = {"sku": sku_query, "language": "en"}
         
         try:
-            # print(f"Requesting supplier batch {i+1}/{len(chunks)}...")
             response = requests.get(SUPPLIER_API_URL, headers=headers, params=params, timeout=30)
             
             if response.status_code in [200, 400]:
@@ -150,52 +116,54 @@ def get_supplier_inventory(sku_list):
 
                 if isinstance(data, dict):
                     items = data.get('items', [])
+                    
+                    # FIX: Handle case where 'items' is a single dict (not a list)
+                    if isinstance(items, dict):
+                        items = [items]
+                    
                     if isinstance(items, list):
                         for item in items:
                             if isinstance(item, dict):
-                                item_sku = item.get('sku')
+                                item_sku = str(item.get('sku')).strip()
                                 qty_data = item.get('quantity', {})
                                 if isinstance(qty_data, dict):
                                     qty = qty_data.get('value')
                                     if item_sku and qty is not None:
                                         inventory_map[item_sku] = int(qty)
+                                        
+                                        # TRACER
+                                        if item_sku == TRACE_SKU:
+                                            print(f"🕵️ TRACER: Supplier returned {TRACE_SKU} with Quantity: {qty}")
             else:
-                print(f"Error fetching batch {i+1}: Status {response.status_code}")
+                print(f"Batch {i+1} status: {response.status_code}")
 
         except Exception as e:
             print(f"Exception in batch {i+1}: {e}")
         
         time.sleep(0.5)
         
-    print(f"Successfully fetched stock for {len(inventory_map)} items.")
+    # Final check for Tracer
+    if TRACE_SKU not in inventory_map:
+        print(f"🕵️ TRACER WARNING: {TRACE_SKU} was NOT found in the Supplier response data.")
+    
     return inventory_map
 
 def bulk_update_inventory(location_id, updates):
-    """Sends a bulk mutation to Shopify to update inventory."""
-    if not updates:
-        print("No updates to send.")
-        return
+    if not updates: return
 
-    # PRINT VERIFICATION FOR USER
-    print("\n--- VERIFICATION: FIRST 3 UPDATES ---")
-    for i in range(min(3, len(updates))):
-        u = updates[i]
-        print(f"Attempting to set Item {u['inventoryItemId']} to Quantity: {u['quantity']}")
-    print("-------------------------------------\n")
+    # Check tracer in updates list
+    found_in_updates = False
+    for u in updates:
+        # We can't see the SKU here easily, but we can verify count
+        pass 
 
     mutation = """
     mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
       inventorySetQuantities(input: $input) {
-        userErrors {
-          field
-          message
-        }
+        userErrors { field, message }
         inventoryAdjustmentGroup {
           reason
-          changes {
-            name
-            delta
-          }
+          changes { name, delta }
         }
       }
     }
@@ -205,6 +173,11 @@ def bulk_update_inventory(location_id, updates):
     for i in range(0, len(updates), BATCH_SIZE):
         batch = updates[i:i + BATCH_SIZE]
         
+        # TRACER: Check if our item is in this batch
+        for item in batch:
+            # We don't have the SKU key here, but if the count matches expected tracer count...
+            pass
+
         variables = {
             "input": {
                 "reason": "correction",
@@ -217,15 +190,12 @@ def bulk_update_inventory(location_id, updates):
         print(f"Sending Shopify update batch {i//BATCH_SIZE + 1}...")
         try:
             data = run_query(mutation, variables)
-            
             if data.get('data') and data['data'].get('inventorySetQuantities'):
                  user_errors = data['data']['inventorySetQuantities']['userErrors']
                  if user_errors:
                      print("Errors in batch:", user_errors)
                  else:
                      print("Batch success.")
-            else:
-                 print("Batch failed, unknown response structure:", data)
         except Exception as e:
             print(f"Failed to send batch: {e}")
         
@@ -239,22 +209,32 @@ def main():
     all_skus = list(shopify_map.keys())
     
     if not all_skus:
-        print("No products found in Shopify for this location.")
+        print("No products found.")
         return
 
     supplier_data = get_supplier_inventory(all_skus)
     
     updates = []
+    tracer_quantity_to_send = None
+
     for sku, qty in supplier_data.items():
         if sku in shopify_map:
             inventory_item_id = shopify_map[sku]
             
+            # TRACER
+            if sku == TRACE_SKU:
+                tracer_quantity_to_send = qty
+                print(f"🕵️ TRACER: Preparing update for {TRACE_SKU}. Item ID: {inventory_item_id} -> New Qty: {qty}")
+
             updates.append({
                 "inventoryItemId": inventory_item_id,
                 "locationId": location_id,
                 "quantity": int(qty)
             })
-            
+    
+    if tracer_quantity_to_send is None:
+        print(f"🕵️ TRACER ALERT: {TRACE_SKU} was NOT added to the update list. Check if SKUs match exactly between Shopify and Supplier.")
+
     print(f"Prepared {len(updates)} updates.")
     bulk_update_inventory(location_id, updates)
 
