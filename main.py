@@ -23,7 +23,6 @@ HEADERS = {
 }
 
 # Target Location: Thibault
-# We use this ID to filter WHAT we fetch, and WHERE we update.
 TARGET_LOCATION_ID = "gid://shopify/Location/105008496957"
 GRAPHQL_URL = f"https://{SHOP_URL}/admin/api/2024-01/graphql.json"
 
@@ -44,14 +43,13 @@ def run_query(query, variables=None):
 def get_shopify_product_map():
     """
     Fetches ONLY inventory items assigned to the Thibault Location.
-    This avoids fetching the 50,000 items from other locations.
     """
     print(f"Fetching products ONLY from Location {TARGET_LOCATION_ID}...")
     product_map = {}
     has_next_page = True
     cursor = None
 
-    # We query the 'location' directly, and ask for its 'inventoryLevels'
+    # CORRECTION: The field on InventoryLevel is 'item', not 'inventoryItem'
     query = """
     query ($locationId: ID!, $cursor: String) {
       location(id: $locationId) {
@@ -62,7 +60,7 @@ def get_shopify_product_map():
           }
           edges {
             node {
-              item: inventoryItem {
+              item { 
                 id
                 variant {
                   sku
@@ -83,17 +81,16 @@ def get_shopify_product_map():
         
         data = run_query(query, variables)
         
-        # Check if location exists
-        if not data['data']['location']:
-            raise Exception("Location not found! Check the ID.")
+        if not data.get('data') or not data['data'].get('location'):
+            raise Exception(f"Location {TARGET_LOCATION_ID} not found or access denied.")
 
         inventory_levels = data['data']['location']['inventoryLevels']['edges']
         
         for level in inventory_levels:
-            # Navigate: InventoryLevel -> InventoryItem -> Variant -> SKU
+            # Navigate: InventoryLevel -> Item -> Variant -> SKU
             item = level['node']['item']
             
-            # Some inventory items might not be linked to a variant (rare, but possible)
+            # Check if item has a variant (some inventory items might not)
             if item.get('variant'):
                 sku = item['variant']['sku']
                 item_id = item['id']
@@ -118,7 +115,7 @@ def get_supplier_inventory(sku_list):
     print(f"Fetching supplier data for {len(sku_list)} SKUs...")
     inventory_map = {}
     
-    # Chunk SKUs into batches of 50 to keep URL short
+    # Chunk SKUs into batches of 50
     CHUNK_SIZE = 50
     chunks = [sku_list[i:i + CHUNK_SIZE] for i in range(0, len(sku_list), CHUNK_SIZE)]
 
@@ -201,11 +198,14 @@ def bulk_update_inventory(location_id, updates):
         print(f"Sending Shopify update batch {i//BATCH_SIZE + 1}...")
         data = run_query(mutation, variables)
         
-        user_errors = data['data']['inventorySetQuantities']['userErrors']
-        if user_errors:
-            print("Errors in batch:", user_errors)
+        if data.get('data') and data['data'].get('inventorySetQuantities'):
+             user_errors = data['data']['inventorySetQuantities']['userErrors']
+             if user_errors:
+                 print("Errors in batch:", user_errors)
+             else:
+                 print("Batch success.")
         else:
-            print("Batch success.")
+             print("Batch failed, unknown response structure:", data)
         
         time.sleep(1)
 
@@ -221,7 +221,7 @@ def main():
         print("No products found in Shopify for this location.")
         return
 
-    # 2. Ask Supplier for stock of ONLY these 500 items
+    # 2. Ask Supplier for stock of ONLY these items
     supplier_data = get_supplier_inventory(all_skus)
     
     # 3. Match them up
