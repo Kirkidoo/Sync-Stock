@@ -1,0 +1,34 @@
+name: Daily Inventory Sync
+
+on:
+  schedule:
+    # Runs every 4 hours (at minute 0)
+    # You can change this using cron syntax: https://crontab.guru/
+    - cron: '0 */4 * * *'
+  
+  # Allows you to run this workflow manually from the Actions tab for testing
+  workflow_dispatch:
+
+jobs:
+  sync_inventory:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Sync Script
+        env:
+          # Pulls the secrets from GitHub
+          ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOP_URL: ${{ secrets.SHOP_URL }}
+        run: python main.py
