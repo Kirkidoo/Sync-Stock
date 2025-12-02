@@ -30,4 +30,4 @@ jobs:
           SHOP_URL: ${{ secrets.SHOP_URL }}
           SUPPLIER_API_URL: ${{ secrets.SUPPLIER_API_URL }}
           SUPPLIER_API_TOKEN: ${{ secrets.SUPPLIER_API_TOKEN }}
-        run: python debug_supplier.py
+        run: python main.py
