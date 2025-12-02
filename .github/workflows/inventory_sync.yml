@@ -1,12 +1,8 @@
-name: Daily Inventory Sync
+name: Inventory Sync
 
 on:
   schedule:
-    # Runs every 4 hours (at minute 0)
-    # You can change this using cron syntax: https://crontab.guru/
     - cron: '0 */4 * * *'
-  
-  # Allows you to run this workflow manually from the Actions tab for testing
   workflow_dispatch:
 
 jobs:
@@ -28,7 +24,10 @@ jobs:
 
       - name: Run Sync Script
         env:
-          # Pulls the secrets from GitHub
+          # --- THE BRIDGE IS HERE ---
+          # Make sure these 4 lines exist exactly like this:
           ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
           SHOP_URL: ${{ secrets.SHOP_URL }}
+          SUPPLIER_API_URL: ${{ secrets.SUPPLIER_API_URL }}
+          SUPPLIER_API_TOKEN: ${{ secrets.SUPPLIER_API_TOKEN }}
         run: python main.py
