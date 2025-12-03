@@ -2,6 +2,12 @@ import os
 import requests
 import json
 import time
+import urllib3
+
+# --- DISABLE SSL WARNINGS ---
+# Motovan's API certificate chain is causing verification issues.
+# We disable the warnings because we are going to bypass verification.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONFIGURATION ---
 SHOP_URL = os.environ.get("SHOP_URL")
@@ -98,7 +104,9 @@ def get_motovan_inventory(sku_list):
                 "partNumber": sku
             }
             
-            response = session.get(base_url, params=params, timeout=10)
+            # --- SSL FIX HERE ---
+            # verify=False tells Python to ignore the certificate error
+            response = session.get(base_url, params=params, timeout=10, verify=False)
             
             if response.status_code == 200:
                 data = response.json()
