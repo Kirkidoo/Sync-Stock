@@ -1,0 +1,26 @@
+name: Sync Motovan
+
+on:
+  schedule:
+    - cron: '30 * * * *' # Every hour at minute 30
+  workflow_dispatch:
+
+jobs:
+  sync_motovan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run Motovan Script
+        env:
+          ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOP_URL: ${{ secrets.SHOP_URL }}
+          MOTOVAN_API_KEY: ${{ secrets.MOTOVAN_API_KEY }}
+          MOTOVAN_CUSTOMER_NUMBER: ${{ secrets.MOTOVAN_CUSTOMER_NUMBER }}
+        run: python sync_motovan.py
